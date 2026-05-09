@@ -28,38 +28,8 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from datasets import load_dataset
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-
-
-TRAIN_PROMPTS = [
-    "The capital of France is",
-    "A short proof that two plus two equals four:",
-    "In Python, a list comprehension can",
-    "The next word in the sequence red, orange, yellow is",
-    "A neural network layer computes",
-    "The recipe begins by mixing flour with",
-    "When the sun sets, the sky often",
-    "A database index helps queries by",
-    "The opposite of cold is",
-    "A concise explanation of gravity:",
-    "The first three prime numbers are",
-    "To sort a small array, you can",
-    "The chemical symbol for water is",
-    "In a transformer, attention weights",
-    "The fastest way to check a hypothesis is",
-    "A haiku about rain:",
-]
-
-EVAL_PROMPTS = [
-    "The largest planet in the solar system is",
-    "A shell command to list files is",
-    "The square root of nine is",
-    "Machine learning models are trained by",
-    "A map is useful because it",
-    "The color of a clear daytime sky is",
-    "A good unit test should",
-    "The story ended when the hero",
-]
 
 
 LINEAR_SUFFIXES = (
@@ -192,13 +162,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--teacher-model", default="RedHatAI/Qwen2.5-0.5B-FP8-dynamic")
     parser.add_argument("--output-dir", default="outputs/hf_fp8_int32")
+    parser.add_argument("--dataset-name", default="Salesforce/wikitext")
+    parser.add_argument("--dataset-config", default="wikitext-103-raw-v1")
+    parser.add_argument("--dataset-text-column", default="text")
+    parser.add_argument("--train-split", default="train")
+    parser.add_argument("--eval-split", default="validation")
+    parser.add_argument("--min-prompt-chars", type=int, default=80)
+    parser.add_argument("--max-prompt-chars", type=int, default=800)
     parser.add_argument("--seq-len", type=int, default=24)
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--max-train-prompts", type=int, default=len(TRAIN_PROMPTS))
-    parser.add_argument("--max-eval-prompts", type=int, default=len(EVAL_PROMPTS))
+    parser.add_argument("--max-train-prompts", type=int, default=16)
+    parser.add_argument("--max-eval-prompts", type=int, default=8)
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--eval-every", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=2.0e-4)
+    parser.add_argument("--lr", type=float, default=1.0e-7)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--matmul-loss-weight", type=float, default=0.05)
     parser.add_argument("--logit-loss-weight", type=float, default=1.0)
@@ -215,6 +192,86 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cuda.matmul.allow_tf32 = True
+
+
+def dataset_config_arg(value: str | None) -> str | None:
+    if value is None or value.strip() == "":
+        return None
+    return value
+
+
+def normalize_prompt(text: str) -> str:
+    return " ".join(text.split())
+
+
+def load_prompt_split(
+    dataset_name: str,
+    dataset_config: str | None,
+    split: str,
+    text_column: str,
+    count: int,
+    min_chars: int,
+    max_chars: int,
+) -> list[str]:
+    if count < 1:
+        raise ValueError("prompt count must be at least 1")
+    config = dataset_config_arg(dataset_config)
+    if config is None:
+        dataset = load_dataset(dataset_name, split=split)
+    else:
+        dataset = load_dataset(dataset_name, config, split=split)
+    prompts = []
+    for row in dataset:
+        if text_column not in row:
+            raise KeyError(f"dataset row does not contain text column {text_column!r}; columns are {list(row.keys())}")
+        value = row[text_column]
+        if not isinstance(value, str):
+            continue
+        prompt = normalize_prompt(value)
+        if len(prompt) < min_chars:
+            continue
+        prompts.append(prompt[:max_chars])
+        if len(prompts) >= count:
+            break
+    if len(prompts) < count:
+        raise RuntimeError(
+            f"only found {len(prompts)} usable prompts in {dataset_name}/{dataset_config}:{split}; "
+            f"requested {count}"
+        )
+    return prompts
+
+
+def load_experiment_prompts(args: argparse.Namespace) -> tuple[list[str], list[str], dict]:
+    train_prompts = load_prompt_split(
+        dataset_name=args.dataset_name,
+        dataset_config=args.dataset_config,
+        split=args.train_split,
+        text_column=args.dataset_text_column,
+        count=args.max_train_prompts,
+        min_chars=args.min_prompt_chars,
+        max_chars=args.max_prompt_chars,
+    )
+    eval_prompts = load_prompt_split(
+        dataset_name=args.dataset_name,
+        dataset_config=args.dataset_config,
+        split=args.eval_split,
+        text_column=args.dataset_text_column,
+        count=args.max_eval_prompts,
+        min_chars=args.min_prompt_chars,
+        max_chars=args.max_prompt_chars,
+    )
+    summary = {
+        "dataset_name": args.dataset_name,
+        "dataset_config": args.dataset_config,
+        "dataset_text_column": args.dataset_text_column,
+        "train_split": args.train_split,
+        "eval_split": args.eval_split,
+        "min_prompt_chars": args.min_prompt_chars,
+        "max_prompt_chars": args.max_prompt_chars,
+        "train_prompts": len(train_prompts),
+        "eval_prompts": len(eval_prompts),
+    }
+    return train_prompts, eval_prompts, summary
 
 
 def tokenize_batches(tokenizer, prompts: list[str], batch_size: int, seq_len: int) -> list[dict[str, torch.Tensor]]:
@@ -583,6 +640,7 @@ def write_report(
     out_dir: Path,
     args: argparse.Namespace,
     teacher_config,
+    data_summary: dict,
     teacher_dtype_summary: dict[str, str],
     counts: dict[str, int],
     metric_rows: list[dict],
@@ -615,6 +673,14 @@ def write_report(
 - Trainable student parameters: `{counts["student_trainable_parameters"]:,}` of `{counts["student_parameters"]:,}` total.
 - Replaced linear modules: `{counts["int32_linear_modules"]}`.
 - Runtime: `{elapsed_s:.1f}` seconds on `{args.device}`.
+
+## Data
+
+- Dataset: `{data_summary["dataset_name"]}` / `{data_summary["dataset_config"]}`.
+- Text column: `{data_summary["dataset_text_column"]}`.
+- Train split/prompts: `{data_summary["train_split"]}` / `{data_summary["train_prompts"]}`.
+- Eval split/prompts: `{data_summary["eval_split"]}` / `{data_summary["eval_prompts"]}`.
+- Prompt character range: at least `{data_summary["min_prompt_chars"]}`, truncated to `{data_summary["max_prompt_chars"]}`.
 
 ## Teacher FP8 Checkpoint
 
@@ -678,6 +744,19 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    print(f"loading dataset prompts: {args.dataset_name}/{args.dataset_config}", flush=True)
+    train_prompts, eval_prompts, data_summary = load_experiment_prompts(args)
+    (out_dir / "dataset_prompts.json").write_text(
+        json.dumps(
+            {
+                "summary": data_summary,
+                "train_prompts": train_prompts,
+                "eval_prompts": eval_prompts,
+            },
+            indent=2,
+        )
+    )
+
     print(f"loading fp8 teacher: {args.teacher_model}", flush=True)
     teacher_config = AutoConfig.from_pretrained(args.teacher_model)
     teacher = AutoModelForCausalLM.from_pretrained(
@@ -713,8 +792,8 @@ def main() -> None:
     )
 
     print("precomputing teacher targets", flush=True)
-    train_raw = tokenize_batches(tokenizer, TRAIN_PROMPTS[: args.max_train_prompts], args.batch_size, args.seq_len)
-    eval_raw = tokenize_batches(tokenizer, EVAL_PROMPTS[: args.max_eval_prompts], args.batch_size, args.seq_len)
+    train_raw = tokenize_batches(tokenizer, train_prompts, args.batch_size, args.seq_len)
+    eval_raw = tokenize_batches(tokenizer, eval_prompts, args.batch_size, args.seq_len)
     train_batches = precompute_teacher_batches(teacher, train_raw, matmul_names, device)
     eval_batches = precompute_teacher_batches(teacher, eval_raw, matmul_names, device)
 
@@ -783,6 +862,7 @@ def main() -> None:
         out_dir=out_dir,
         args=args,
         teacher_config=teacher_config,
+        data_summary=data_summary,
         teacher_dtype_summary=teacher_dtype_summary,
         counts=counts,
         metric_rows=metric_rows,

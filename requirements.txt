@@ -1,5 +1,6 @@
 accelerate
 compressed-tensors
+datasets
 huggingface_hub
 matplotlib
 numpy

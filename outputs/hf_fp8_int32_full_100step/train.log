@@ -1,31 +1,0 @@
-loading tokenizer: RedHatAI/Qwen2.5-0.5B-FP8-dynamic
-loading fp8 teacher: RedHatAI/Qwen2.5-0.5B-FP8-dynamic
-Compressing model:   0%|          | 0/319 [00:00<?, ?it/s]Compressing model:  93%|█████████▎| 298/319 [00:00<00:00, 2962.35it/s]Compressing model: 100%|██████████| 319/319 [00:00<00:00, 2980.84it/s]
-Loading weights:   0%|          | 0/459 [00:00<?, ?it/s]Loading weights:  76%|███████▌  | 347/459 [00:00<00:00, 3459.26it/s]Loading weights: 100%|██████████| 459/459 [00:00<00:00, 3857.35it/s]
-Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
-Decompressing model:   0%|          | 0/319 [00:00<?, ?it/s]Decompressing model: 100%|██████████| 319/319 [00:00<00:00, 14131.63it/s]
-building int32 student
-precomputing teacher targets
-step 0000 eval logit_l2=74.4146 matmul_rmse=0.0859
-training student
-step 0010 train loss=0.0133 logit_mse=0.0129 matmul_nmse=0.0067
-step 0010 eval logit_l2=79.7241 matmul_rmse=0.0860
-step 0020 train loss=0.0217 logit_mse=0.0214 matmul_nmse=0.0056
-step 0020 eval logit_l2=84.4348 matmul_rmse=0.0861
-step 0030 train loss=0.0081 logit_mse=0.0078 matmul_nmse=0.0067
-step 0030 eval logit_l2=79.5756 matmul_rmse=0.0860
-step 0040 train loss=0.0106 logit_mse=0.0104 matmul_nmse=0.0056
-step 0040 eval logit_l2=77.7231 matmul_rmse=0.0859
-step 0050 train loss=0.0049 logit_mse=0.0046 matmul_nmse=0.0067
-step 0050 eval logit_l2=76.7093 matmul_rmse=0.0859
-step 0060 train loss=0.0057 logit_mse=0.0054 matmul_nmse=0.0054
-step 0060 eval logit_l2=76.3567 matmul_rmse=0.0859
-step 0070 train loss=0.0028 logit_mse=0.0025 matmul_nmse=0.0065
-step 0070 eval logit_l2=76.5593 matmul_rmse=0.0859
-step 0080 train loss=0.0033 logit_mse=0.0031 matmul_nmse=0.0053
-step 0080 eval logit_l2=76.7683 matmul_rmse=0.0859
-step 0090 train loss=0.0018 logit_mse=0.0015 matmul_nmse=0.0066
-step 0090 eval logit_l2=76.7243 matmul_rmse=0.0856
-step 0100 train loss=0.0024 logit_mse=0.0021 matmul_nmse=0.0053
-step 0100 eval logit_l2=77.0560 matmul_rmse=0.0858
-done: outputs/hf_fp8_int32_full_100step/report.md
