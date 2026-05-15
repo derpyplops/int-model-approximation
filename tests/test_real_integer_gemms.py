@@ -134,6 +134,39 @@ def test_int32_linear_forward_uses_the_int32_matmul_path(
     assert y.shape == (2, 4)
 
 
+def test_fp8_codebook_correction_uses_only_int32_matmul_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_cuda_requirement(monkeypatch)
+    fp8_weight = torch.randn(4, 3).to(torch.float8_e4m3fn)
+    layer = entry.Int32Linear(
+        fp8_weight.to(torch.float32),
+        bias=None,
+        fp8_weight=fp8_weight,
+        fp8_weight_scale=torch.ones(4, 1),
+    )
+    calls = []
+
+    def fake_int32_matmul(
+        activations: torch.Tensor,
+        weight_t: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        calls.append((activations, weight_t, x_scale, w_scale))
+        assert activations.dtype == torch.int32
+        assert weight_t.dtype == torch.int32
+        return torch.zeros((activations.shape[0], weight_t.shape[1]), dtype=torch.float32)
+
+    monkeypatch.setattr(entry, "_int32_matmul", fake_int32_matmul)
+    _patch_non_int_gemm_fallbacks(monkeypatch)
+
+    y = layer(torch.randn(2, 3))
+
+    assert len(calls) == 2
+    assert y.shape == (2, 4)
+
+
 def test_int32_path_source_has_no_float_gemm_or_fake_quant_fallbacks() -> None:
     source = "\n".join(
         [

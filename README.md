@@ -15,8 +15,10 @@ integer Freivalds checks?
 The only supported run loads `RedHatAI/Qwen2.5-0.5B-FP8-dynamic`, executes a real
 FP8 reference forward with `torch._scaled_mm`, builds an integerized copy whose
 linears use Triton `int32 x int32 -> int64` CUDA kernels, and writes layer and
-logit error metrics. There are no fake-quant, emulation, training, sweep, or
-alternate model paths.
+logit error metrics. FP8 checkpoint linears also run a second integer product
+over exact FP8-codebook integer values and apply a fixed deterministic correction
+to the primary integer product. There are no fake-quant, emulation, training,
+sweep, or alternate model paths.
 
 ## Development target
 
