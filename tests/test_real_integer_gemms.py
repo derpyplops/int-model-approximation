@@ -64,6 +64,35 @@ def _patch_non_int_gemm_fallbacks(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(torch, "_scaled_mm", fail)
 
 
+def _exact_matvec(matrix: list[list[int]], vector: list[int]) -> list[int]:
+    return [sum(value * vector[col] for col, value in enumerate(row)) for row in matrix]
+
+
+def _assert_freivalds_verifies_int_product(
+    activations: torch.Tensor,
+    weight_t: torch.Tensor,
+) -> None:
+    product = entry._int32_raw_matmul(activations, weight_t)
+    torch.cuda.synchronize()
+
+    assert product.dtype == torch.int64
+    assert product.device.type == "cuda"
+    a = activations.cpu().to(torch.int64).tolist()
+    b = weight_t.cpu().to(torch.int64).tolist()
+    c = product.cpu().tolist()
+    vectors = [
+        [1] + [0] * (weight_t.shape[1] - 1),
+        [1 if idx % 2 == 0 else -1 for idx in range(weight_t.shape[1])],
+        [0 if idx % 3 == 0 else 1 for idx in range(weight_t.shape[1])],
+    ]
+    for r in vectors:
+        assert _exact_matvec(a, _exact_matvec(b, r)) == _exact_matvec(c, r)
+
+    corrupted = [row.copy() for row in c]
+    corrupted[0][0] += 1
+    assert _exact_matvec(a, _exact_matvec(b, vectors[0])) != _exact_matvec(corrupted, vectors[0])
+
+
 def test_int32_matmul_rejects_non_int_operands_before_launch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -246,25 +275,60 @@ def test_raw_int32_matmul_is_freivalds_verifiable() -> None:
         dtype=torch.int32,
     )
 
-    product = entry._int32_raw_matmul(activations, weight_t)
-    torch.cuda.synchronize()
+    _assert_freivalds_verifies_int_product(activations, weight_t)
 
-    assert product.dtype == torch.int64
-    assert product.device.type == "cuda"
-    a = activations.cpu().to(torch.int64)
-    b = weight_t.cpu().to(torch.int64)
-    c = product.cpu()
-    vectors = [
-        torch.tensor([1, 0, 0, 0, 0, 0], dtype=torch.int64),
-        torch.tensor([1, -1, 2, -2, 3, -3], dtype=torch.int64),
-        torch.tensor([-5, 8, -13, 21, -34, 55], dtype=torch.int64),
-    ]
-    for r in vectors:
-        assert torch.equal(a @ (b @ r), c @ r)
 
-    corrupted = c.clone()
-    corrupted[0, 0] += 1
-    assert not torch.equal(a @ (b @ vectors[0]), corrupted @ vectors[0])
+@pytest.mark.skipif(
+    not _cuda_int_kernel_available(),
+    reason="requires CUDA with SM_89+ to execute the real Triton int32 kernel",
+)
+def test_forward_integer_gemms_are_freivalds_verifiable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fp8_weight = torch.tensor(
+        [
+            [0.125, -0.5, 1.0],
+            [-1.5, 0.25, 2.0],
+            [3.0, -0.75, 0.5],
+            [-2.5, 1.5, -0.125],
+        ],
+        device="cuda",
+        dtype=torch.float32,
+    ).to(torch.float8_e4m3fn)
+    linear = nn.Linear(3, 4, bias=False, device="cuda")
+    linear.weight = nn.Parameter(fp8_weight, requires_grad=False)
+    linear.weight_scale = torch.ones(4, 1, device="cuda")
+    model = nn.Sequential(linear)
+    entry._replace_int32_linears(model)
+    int_layer = model[0]
+    captured_products = []
+    original_int32_matmul = entry._int32_matmul
+
+    def wrapped_int32_matmul(
+        activations: torch.Tensor,
+        weight_t: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        captured_products.append((activations.detach().clone(), weight_t.detach().clone()))
+        return original_int32_matmul(activations, weight_t, x_scale, w_scale)
+
+    monkeypatch.setattr(entry, "_int32_matmul", wrapped_int32_matmul)
+    x = torch.tensor(
+        [[0.25, -1.5, 2.0], [3.0, -0.75, 0.125]],
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    with torch.inference_mode():
+        y = model(x)
+        torch.cuda.synchronize()
+
+    expected_products = 2 if hasattr(int_layer, "codebook_weight_t") else 1
+    assert y.device.type == "cuda"
+    assert len(captured_products) == expected_products
+    for activations, weight_t in captured_products:
+        _assert_freivalds_verifies_int_product(activations, weight_t)
 
 
 @pytest.mark.skipif(
