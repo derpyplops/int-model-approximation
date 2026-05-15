@@ -171,6 +171,8 @@ def test_int32_path_source_has_no_float_gemm_or_fake_quant_fallbacks() -> None:
     source = "\n".join(
         [
             _source_for_named_node("Int32Linear"),
+            _source_for_named_node("_int32_raw_matmul"),
+            _source_for_named_node("_int32_raw_matmul_kernel"),
             _source_for_named_node("_int32_matmul"),
             _source_for_named_node("_int32_matmul_kernel"),
         ]
@@ -212,6 +214,57 @@ def test_int32_path_source_has_no_float_gemm_or_fake_quant_fallbacks() -> None:
     assert "tl.zeros((block_m, block_n), dtype=tl.int64)" in source
     assert ".to(tl.int64)" in source
     assert all(text not in source for text in forbidden_text)
+
+
+@pytest.mark.skipif(
+    not _cuda_int_kernel_available(),
+    reason="requires CUDA with SM_89+ to execute the real Triton int32 kernel",
+)
+def test_raw_int32_matmul_is_freivalds_verifiable() -> None:
+    activations = torch.tensor(
+        [
+            [2, -3, 5, 7, -11, 13, 17],
+            [-19, 23, -29, 31, 37, -41, 43],
+            [47, -53, 59, -61, 67, 71, -73],
+            [-79, 83, 89, -97, 101, -103, 107],
+            [109, -113, 127, 131, -137, 139, -149],
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    weight_t = torch.tensor(
+        [
+            [3, -5, 7, -11, 13, -17],
+            [-19, 23, -29, 31, -37, 41],
+            [43, -47, 53, -59, 61, -67],
+            [-71, 73, -79, 83, -89, 97],
+            [101, -103, 107, -109, 113, -127],
+            [-131, 137, -139, 149, -151, 157],
+            [163, -167, 173, -179, 181, -191],
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    product = entry._int32_raw_matmul(activations, weight_t)
+    torch.cuda.synchronize()
+
+    assert product.dtype == torch.int64
+    assert product.device.type == "cuda"
+    a = activations.cpu().to(torch.int64)
+    b = weight_t.cpu().to(torch.int64)
+    c = product.cpu()
+    vectors = [
+        torch.tensor([1, 0, 0, 0, 0, 0], dtype=torch.int64),
+        torch.tensor([1, -1, 2, -2, 3, -3], dtype=torch.int64),
+        torch.tensor([-5, 8, -13, 21, -34, 55], dtype=torch.int64),
+    ]
+    for r in vectors:
+        assert torch.equal(a @ (b @ r), c @ r)
+
+    corrupted = c.clone()
+    corrupted[0, 0] += 1
+    assert not torch.equal(a @ (b @ vectors[0]), corrupted @ vectors[0])
 
 
 @pytest.mark.skipif(

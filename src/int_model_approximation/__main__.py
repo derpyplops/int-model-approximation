@@ -129,6 +129,71 @@ def _per_row_int32(weight: torch.Tensor, qmax: float) -> tuple[torch.Tensor, tor
 
 
 @triton.jit
+def _int32_raw_matmul_kernel(
+    a_ptr,
+    b_ptr,
+    out_ptr,
+    m_size: tl.constexpr,
+    n_size: tl.constexpr,
+    k_size: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * block_m + tl.arange(0, block_m)
+    offs_n = pid_n * block_n + tl.arange(0, block_n)
+    accum = tl.zeros((block_m, block_n), dtype=tl.int64)
+
+    for k0 in range(0, k_size, block_k):
+        for kk in range(0, block_k):
+            k = k0 + kk
+            a = tl.load(
+                a_ptr + offs_m * k_size + k,
+                mask=(offs_m < m_size) & (k < k_size),
+                other=0,
+            ).to(tl.int64)
+            b = tl.load(
+                b_ptr + k * n_size + offs_n,
+                mask=(k < k_size) & (offs_n < n_size),
+                other=0,
+            ).to(tl.int64)
+            accum += a[:, None] * b[None, :]
+
+    tl.store(
+        out_ptr + offs_m[:, None] * n_size + offs_n[None, :],
+        accum,
+        mask=(offs_m[:, None] < m_size) & (offs_n[None, :] < n_size),
+    )
+
+
+def _int32_raw_matmul(activations: torch.Tensor, weight_t: torch.Tensor) -> torch.Tensor:
+    _require_cuda_tensor(activations, "int32 activation matrix")
+    _require_cuda_tensor(weight_t, "int32 weight matrix")
+    if activations.dtype != torch.int32 or weight_t.dtype != torch.int32:
+        raise RuntimeError("int32 raw matmul received non-int32 operands")
+    m_size, k_size = activations.shape
+    k2, n_size = weight_t.shape
+    if k_size != k2:
+        raise RuntimeError(f"int32 raw matmul shape mismatch: {activations.shape} @ {weight_t.shape}")
+    out = torch.empty((m_size, n_size), device=activations.device, dtype=torch.int64)
+    _int32_raw_matmul_kernel[(triton.cdiv(m_size, BLOCK_M), triton.cdiv(n_size, BLOCK_N))](
+        activations,
+        weight_t,
+        out,
+        m_size,
+        n_size,
+        k_size,
+        block_m=BLOCK_M,
+        block_n=BLOCK_N,
+        block_k=BLOCK_K,
+        num_warps=4,
+    )
+    return out
+
+
+@triton.jit
 def _int32_matmul_kernel(
     a_ptr,
     b_ptr,
