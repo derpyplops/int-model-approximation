@@ -1,16 +1,14 @@
-__pycache__/
-*.py[cod]
-*.egg-info/
+*.venv
+.venv
+__pycache__
+*.pyc
+results/
+*.egg-info
+.pytest_cache
+models/
+difr/
+difr/
+.claude/
 
-.venv/
-venv/
-
-.DS_Store
-*.swp
-
-outputs/
-wandb/
-*.log
-
-.cache/
-.pytest_cache/
+# Captured matmul records / residual datasets — large, regeneratable.
+experiments/int-residual/data/

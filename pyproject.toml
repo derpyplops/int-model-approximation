@@ -1,0 +1,38 @@
+[project]
+name = "int-model-approximation"
+version = "0.0.1"
+description = "Single real-GPU DiFR layer-error measurement"
+requires-python = ">=3.10"
+
+dependencies = [
+    "torch==2.7.1",
+    "transformers==4.57.3",
+    "accelerate>=1.0.1",
+    "compressed-tensors>=0.15.0.1",
+    "safetensors>=0.5.3",
+    "triton==3.3.1",
+]
+
+[project.scripts]
+int-model-approximation = "int_model_approximation.__main__:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.uv]
+environments = [
+    "implementation_name == 'cpython' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100

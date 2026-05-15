@@ -1,34 +1,53 @@
-# Int Model Approximation
+# int-model-approximation
 
-Experiment harness for converting a Hugging Face FP8 causal language model into a full-depth int32/fixed-point copy and measuring whether training reduces divergence from the FP8 teacher.
+Single-path DiFR layer-error measurement for a real quantized Hugging Face model.
 
-## Setup
+The only supported run loads `RedHatAI/Qwen2.5-0.5B-FP8-dynamic`, executes a real
+FP8 reference forward with `torch._scaled_mm`, builds an integerized copy whose
+linears use Triton `int32 x int32 -> int64` CUDA kernels, and writes layer and
+logit error metrics.
 
-```bash
-python -m pip install -r requirements.txt
-```
+There are no fake-quant, emulation, training, sweep, or alternate model paths.
 
-The default teacher is `RedHatAI/Qwen2.5-0.5B-FP8-dynamic`. The default data source is the curated Wikipedia corpus [`Salesforce/wikitext`](https://huggingface.co/datasets/Salesforce/wikitext) with the `wikitext-103-raw-v1` config, using `train` prompts for fitting and `validation` prompts for held-out eval.
+## Requirements
+
+- CUDA GPU with SM_89+ support
+- Python managed through `uv`
+- Network/HF access to download `RedHatAI/Qwen2.5-0.5B-FP8-dynamic`
 
 ## Run
 
 ```bash
-python experiments/hf_fp8_int32_distill.py --steps 100 --eval-every 10 --output-dir outputs/hf_fp8_int32_run
+uv run python -m int_model_approximation
 ```
 
-Useful knobs:
+or:
 
 ```bash
---max-train-prompts 16
---max-eval-prompts 8
---seq-len 24
---weight-bits 16
---activation-bits 16
---lr 1e-7
+uv run int-model-approximation
 ```
 
-## Outputs
+The result is written to:
 
-Each run writes metrics, per-matmul errors, plots, selected dataset prompts, run config, and a concise report under `outputs/<run-name>/`.
+```text
+results/difr_layer_errors.json
+```
 
-The int32 copy keeps the teacher architecture and depth. Linear layers use fake quantization with straight-through gradients during training, and explicit `int32 x int32 -> int64 accumulate -> float dequantize` matmuls during evaluation.
+## Output
+
+The JSON includes:
+
+- per-layer isolated L2 error: one integerized layer run on cached FP8-reference inputs
+- per-layer cumulative L2 error: full integerized model output at each layer vs reference
+- total logit L2 error
+- DiFR score
+- top-1 similarity
+- top-5 similarity
+- kernel launch counts for the FP8 reference and int32 integerized model
+
+## Checks
+
+```bash
+uv run --extra dev pytest
+uv run --extra dev ruff check
+```
