@@ -39,6 +39,8 @@ PROMPT = (
 )
 
 FP8_E4M3_MAX = 448.0
+FP8_E4M3_CODE_SCALE = 512.0
+FP8_CODEBOOK_CORRECTION_ALPHA = 0.3125
 INT32_MAX = (1 << 31) - 1
 INT64_ACCUM_LIMIT = (1 << 62) - 1
 BLOCK_M = 16
@@ -89,6 +91,15 @@ def _per_token_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     scale = (scale / FP8_E4M3_MAX).clamp_min(1e-12)
     q = (rows.to(torch.float32) / scale).to(torch.float8_e4m3fn)
     return q.contiguous(), scale
+
+
+def _fp8_e4m3_to_int32(x: torch.Tensor) -> torch.Tensor:
+    return (x.to(torch.float32) * FP8_E4M3_CODE_SCALE).round().to(torch.int32).contiguous()
+
+
+def _per_token_fp8_int32(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    q_fp8, scale = _per_token_fp8(x)
+    return _fp8_e4m3_to_int32(q_fp8), scale / FP8_E4M3_CODE_SCALE
 
 
 def _int32_qmax(k: int) -> float:
@@ -229,13 +240,35 @@ class FP8Linear(nn.Module):
 class Int32Linear(nn.Module):
     """Linear backed by a real int32 GPU GEMM implemented as a Triton kernel."""
 
-    def __init__(self, weight: torch.Tensor, bias: torch.Tensor | None):
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        fp8_weight: torch.Tensor | None = None,
+        fp8_weight_scale: torch.Tensor | None = None,
+    ):
         super().__init__()
         _require_cuda_tensor(weight, "int32 weight source")
         self.qmax = _int32_qmax(weight.shape[1])
         w_i32, w_scale = _per_row_int32(weight, self.qmax)
         self.register_buffer("weight_t", w_i32.t().contiguous(), persistent=False)
         self.register_buffer("weight_scale", w_scale.reshape(1, -1), persistent=False)
+        self.codebook_alpha = 0.0
+        if fp8_weight is not None:
+            if fp8_weight_scale is None:
+                raise RuntimeError("FP8 codebook correction needs per-row weight_scale")
+            if fp8_weight.dtype != torch.float8_e4m3fn:
+                raise RuntimeError(f"FP8 codebook correction needs FP8 weights, got {fp8_weight.dtype}")
+            _require_cuda_tensor(fp8_weight, "FP8 codebook weight")
+            codebook_i32 = _fp8_e4m3_to_int32(fp8_weight.detach())
+            codebook_scale = fp8_weight_scale.detach().to(torch.float32) / FP8_E4M3_CODE_SCALE
+            self.register_buffer(
+                "codebook_weight_t", codebook_i32.t().contiguous(), persistent=False
+            )
+            self.register_buffer(
+                "codebook_weight_scale", codebook_scale.reshape(1, -1), persistent=False
+            )
+            self.codebook_alpha = FP8_CODEBOOK_CORRECTION_ALPHA
         if bias is None:
             self.bias = None
         else:
@@ -248,6 +281,15 @@ class Int32Linear(nn.Module):
         in_shape = x.shape
         x_i32, x_scale = _per_token_int32(x, self.qmax)
         y = _int32_matmul(x_i32, self.weight_t, x_scale, self.weight_scale)
+        if self.codebook_alpha:
+            codebook_x_i32, codebook_x_scale = _per_token_fp8_int32(x)
+            y_codebook = _int32_matmul(
+                codebook_x_i32,
+                self.codebook_weight_t,
+                codebook_x_scale,
+                self.codebook_weight_scale,
+            )
+            y = y + self.codebook_alpha * (y_codebook - y)
         if self.bias is not None:
             y = y + self.bias.to(torch.float32)
         return y.to(x.dtype).reshape(*in_shape[:-1], self.out_features)
@@ -296,7 +338,15 @@ def _replace_int32_linears(model: nn.Module) -> list[str]:
         if isinstance(module, nn.Linear):
             replacements.append((name, module))
     for name, module in replacements:
-        replacement = Int32Linear(_dequantized_weight(module), module.bias)
+        if module.weight.dtype == torch.float8_e4m3fn and hasattr(module, "weight_scale"):
+            replacement = Int32Linear(
+                _dequantized_weight(module),
+                module.bias,
+                fp8_weight=module.weight,
+                fp8_weight_scale=module.weight_scale,
+            )
+        else:
+            replacement = Int32Linear(_dequantized_weight(module), module.bias)
         _set_submodule(model, name, replacement)
     if not replacements:
         raise RuntimeError("No Linear modules were found to integerize.")
@@ -488,6 +538,7 @@ def main() -> None:
         "prompt_tokens": int(input_ids.shape[1]),
         "device": torch.cuda.get_device_name(0),
         "integerized_kernel": "triton_int32_x_int32_to_int64",
+        "integerized_correction": "0.3125 * (fp8_codebook_int_product - high_precision_int_product)",
         "integerized_qmax": "per-layer floor(sqrt((2^62 - 1) / in_features))",
         "runtime_s": time.time() - started,
         "kernel_calls": {
