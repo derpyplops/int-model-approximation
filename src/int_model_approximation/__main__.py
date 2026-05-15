@@ -40,7 +40,11 @@ PROMPT = (
 
 FP8_E4M3_MAX = 448.0
 FP8_E4M3_CODE_SCALE = 512.0
-FP8_CODEBOOK_CORRECTION_ALPHA = 0.3125
+FP8_CODEBOOK_CORRECTION_NUMERATOR = 10
+FP8_CODEBOOK_CORRECTION_DENOMINATOR = 32
+FP8_CODEBOOK_CORRECTION_ALPHA = (
+    FP8_CODEBOOK_CORRECTION_NUMERATOR / FP8_CODEBOOK_CORRECTION_DENOMINATOR
+)
 INT32_MAX = (1 << 31) - 1
 INT64_ACCUM_LIMIT = (1 << 62) - 1
 BLOCK_M = 16
@@ -538,7 +542,7 @@ def main() -> None:
         "prompt_tokens": int(input_ids.shape[1]),
         "device": torch.cuda.get_device_name(0),
         "integerized_kernel": "triton_int32_x_int32_to_int64",
-        "integerized_correction": "0.3125 * (fp8_codebook_int_product - high_precision_int_product)",
+        "integerized_correction": "10/32 * (fp8_codebook_int_product - high_precision_int_product)",
         "integerized_qmax": "per-layer floor(sqrt((2^62 - 1) / in_features))",
         "runtime_s": time.time() - started,
         "kernel_calls": {
