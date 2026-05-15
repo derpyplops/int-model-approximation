@@ -59,6 +59,11 @@ requantization, and kernel-specific accumulation or reduction behavior. Report
 results per layer or matmul family, not only as pooled averages; one bad layer
 can dominate downstream behavior.
 
+Keep [CURRENT_STRATEGY.md](CURRENT_STRATEGY.md) as the concise record of the
+strategies currently used on top of the baseline. When a developer adds or keeps
+a strategy, describe it there; when a strategy is removed from the active path,
+delete it from that record.
+
 ## Requirements
 
 - CUDA GPU with SM_89+ support
