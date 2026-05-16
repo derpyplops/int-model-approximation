@@ -18,3 +18,26 @@ experiments/7b-baseline/
 experiments/nongemm-int/
 experiments/int-kernels/
 experiments/quant-scales/
+
+# Round-2 worktrees (separate branches; kept locally for reference)
+experiments/codebook-v2/
+experiments/k-block-scales/
+experiments/operand-stats/
+experiments/per-layer-search/
+
+# Round-3 worktrees
+experiments/compose-winners/
+experiments/top1-direct/
+experiments/hadamard/
+experiments/act-offset/
+
+# Round-4 worktrees
+experiments/diagnose-ceiling/
+experiments/multi-prompt/
+experiments/higher-precision/
+experiments/lowrank-correction/
+
+# Round-5 worktrees
+experiments/corpus-validate/
+experiments/lowrank-corpus/
+experiments/higher-precision-corpus/
