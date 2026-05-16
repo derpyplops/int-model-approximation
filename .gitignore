@@ -12,3 +12,9 @@ difr/
 
 # Captured matmul records / residual datasets — large, regeneratable.
 experiments/int-residual/data/
+
+# Round-1 worktrees (separate branches; kept locally for reference)
+experiments/7b-baseline/
+experiments/nongemm-int/
+experiments/int-kernels/
+experiments/quant-scales/
