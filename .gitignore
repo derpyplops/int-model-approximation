@@ -44,3 +44,6 @@ experiments/higher-precision-corpus/
 
 # Round-6 deterministic-teacher experiment
 experiments/deterministic-teacher/
+
+# Round-7 fp8-mimic experiment (deferred — see reports/fp8_mimic_findings.md)
+experiments/fp8-mimic/
