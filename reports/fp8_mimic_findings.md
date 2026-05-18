@@ -74,17 +74,56 @@ The fp32 disagreement is < 0.005 — but it crosses the rounding boundary.
 | fraction \|delta\| > 2 ULP   | 7.4%  |
 | mean \|delta\| / bf16 ULP    | 2.15  |
 
-## Hypothesis: FMA inside the Tensor Core
+## Hypothesis evolution: FMA → FDA → partial mismatch
 
-A fused multiply-add `a*b + c` does one IEEE round vs two for
-`(a*b) + c`. fp32 results differ by sub-ULP — exactly the regime we see.
-The H100 Tensor Core MMA instruction (HMMA.16832.F32) is documented as
-performing FMA-style accumulation; that's the natural explanation.
+**First hypothesis: FMA.** A fused multiply-add `a*b + c` does one IEEE
+round vs two for `(a*b) + c`. fp32 results differ by sub-ULP — exactly
+the regime we see. The H100 Tensor Core MMA instruction (HMMA.16832.F32)
+performs FMA-style accumulation.
 
-To reproduce: would need GPU intrinsics (PTX-level FMA) in a custom CUDA
-kernel, replicating the specific tile order cuBLAS picks for the (M, N, K)
-shapes Qwen uses. PyTorch's `torch.addcmul` may use FMA but the per-step
-order can't be forced to match cuBLAS without writing native CUDA.
+**Refinement: FDA.** A subsequent research pass ([`fp8_mimic_research.md`](fp8_mimic_research.md))
+identified the actual algorithm: Hopper FP8 uses **Fused Dot Add** (FDA),
+not chained FMA. Per MMA-Sim ([arXiv:2511.10909](https://arxiv.org/abs/2511.10909)),
+each K=32 tile (a) computes exact products, (b) finds max exponent
+`e_max` across them, (c) right-shift + RZ-truncates each significand to
+**F = 13 fractional bits** below `e_max`, (d) sums the aligned
+fixed-point values, (e) normalizes and RNE-rounds to fp32. This gives
+order-independent reductions within a tile and is "integer over a
+fixed-point grid" — *in principle Freivalds-checkable*.
+
+**Empirical test of FDA.** Implemented FDA in Python
+(`experiments/fp8-mimic/scripts/fda_reference.py`) and tested on H100.
+Result: **FDA does NOT bit-exactly reproduce `_scaled_mm`.**
+
+F-sweep at K=32 single tile, M=N=128 random inputs:
+
+| F (frac bits below e_max) | bit-match vs `_scaled_mm` | note |
+|---|---|---|
+| naive fp32                  | 98.85% | reference |
+| FDA F=13 (MMA-Sim's Hopper FP8) | 98.89% | barely above naive |
+| **FDA F=14**                    | **99.32%** | best F, +0.47pp |
+| FDA F=23 (no truncation)        | 98.85% | identical to naive (sanity check) |
+| FDA F=10 (over-truncated)       | 81.82% | precision loss |
+
+FDA changes 66% of fp32 sums (so the per-tile algorithm IS doing
+something different from naive), but the bf16 cast collapses most of
+that — only 1.76% of bf16-bit positions differ between naive and FDA.
+Both still disagree with `_scaled_mm` at roughly the same 1.1-1.5% rate
+at K=32.
+
+**Diagnosis.** `_scaled_mm` is doing something beyond pure per-tile FDA.
+Most likely:
+- CUTLASS "fast accum" mode: plain fp32 FMA chain across K, not FDA.
+  PyTorch's choice between "fast" and "slow" accum is dispatcher-internal
+  and shape-dependent.
+- Or a different intra-tile reduction structure than the one MMA-Sim
+  characterized.
+- Or a different F value used per pair instead of per tile.
+
+To find the precise recipe would mean reading `RowwiseScaledMM.cu`,
+CUTLASS's `fp8_accumulation.hpp`, and the cuBLAS algorithm dispatcher
+for the specific (M, N, K) tuples Qwen uses on H100 — and rebuilding
+that knowledge on every CUDA driver / GPU arch update.
 
 ## Implications for the project
 
@@ -97,8 +136,10 @@ order can't be forced to match cuBLAS without writing native CUDA.
 
 2. **A bit-exact integer FP8 mimic is plausible but is a CUDA/PTX-kernel
    research project**, not a quick Triton patch. The bf16-cast wipes out
-   most fp32-reduction-order differences, so the only lever left is
-   matching the FMA pattern exactly.
+   most fp32-reduction-order differences. Even FDA, which is the closest
+   public reference for what the Tensor Core does, only closes ~0.5pp of
+   the per-tile gap — the residual is in cuBLAS's specific kernel choice,
+   which is shape-dependent and CUDA-version-locked.
 
 3. **The ZKP target doesn't want this.** The deterministic-fp32 teacher
    already produces a clean reference that the integer student tracks
@@ -116,8 +157,12 @@ order can't be forced to match cuBLAS without writing native CUDA.
 - `experiments/fp8-mimic/plan.md` — 7-phase implementation plan (deferred).
 - `experiments/fp8-mimic/scripts/probe_k1.py` — K=1 sanity (passes).
 - `experiments/fp8-mimic/scripts/probe_k2.py` — K=2 (passes, not discriminating).
-- `experiments/fp8-mimic/scripts/probe_k_sweep.py` — random-input K sweep, 4 fp32 reducer candidates.
+- `scripts/probe_k_sweep.py` — random-input K sweep, 4 fp32 reducer candidates (committed).
 - `experiments/fp8-mimic/scripts/probe_bf16_accum.py` — bf16-accumulator hypothesis (refuted).
 - `experiments/fp8-mimic/scripts/probe_tile_reductions.py` — MMA-tile-shaped reductions.
-- `experiments/fp8-mimic/scripts/probe_rounding.py` — rounding-mode / FMA diagnostic.
-- `experiments/fp8-mimic/EXPERIMENT_LOG.md` — append-only log.
+- `scripts/probe_fp8_rounding.py` — rounding-mode / FMA diagnostic (committed).
+- `experiments/fp8-mimic/scripts/fda_reference.py` — FDA Python implementation.
+- `experiments/fp8-mimic/scripts/fda_F_sweep.py` — F-value calibration sweep on H100.
+- `experiments/fp8-mimic/scripts/fda_diagnose.py` — fp32-vs-bf16 disagreement diagnostic.
+- `experiments/fp8-mimic/EXPERIMENT_LOG.md` — append-only log (gitignored along with the rest of the experiment dir; the scripts above are mirrored to top-level `scripts/`).
+- `reports/fp8_mimic_research.md` — agent's CUDA-approach research; describes Option C (software FDA) which was empirically tested above.
