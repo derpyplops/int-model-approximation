@@ -1,6 +1,50 @@
 # Research summary
 
-Five rounds, sixteen branches, one definitive answer.
+Five rounds of correction-strategy search, plus a final round-6 experiment
+that overturns the round-5 conclusion.
+
+## TL;DR (updated 2026-05-18)
+
+**The 0.9532 corpus top1 was the FP8-hardware-rounding floor, not the
+int32-quantization floor.** Round-6's `deterministic-teacher` experiment
+replaces the FP8 teacher kernel (`torch._scaled_mm`) with a deterministic
+fp32 GEMM over the SAME FP8 codebook weights. The integer student is
+unchanged. Against this teacher:
+
+- **corpus top1 = 0.9983** (4 disagreements / 2416 tokens)
+- **single-prompt top1 = 0.9960**
+- **corpus logit_l2 = 2.557** (vs FP8 teacher's 75.97 — 30× reduction)
+- best α: **0** (codebook correction was overfitting to FP8 hardware noise)
+
+The integer student is far better than rounds 2-5 suggested. The "0.9532
+ceiling" was a property of the comparison oracle, not the prover.
+
+## Round 6 finding (the actual ceiling)
+
+| teacher | α | corpus top1 | corpus logit_l2 |
+|---|---:|---:|---:|
+| FP8 hardware (`torch._scaled_mm`) | 10/32 | 0.9532 | 75.97 |
+| FP8 hardware | 6/32 | 0.9524 | 74.52 |
+| Deterministic fp32 (same FP8 weights) | 10/32 | 0.9839 | 24.15 |
+| Deterministic fp32 | 6/32 | 0.9888 | 14.57 |
+| **Deterministic fp32** | **0** | **0.9983** | **2.557** |
+
+Only difference between rows: `FP8Linear.forward`. Integer student
+identical. The deterministic-fp32 teacher precomputes
+`w_fp32 = w_fp8.float() * weight_scale` at construction and runs
+`x.float() @ w_fp32.t()` at forward — same FP8 codebook in the weight,
+no per-token activation FP8 quant, no bf16 accumulator rounding.
+
+Note the reversal on α: the codebook correction (α=10/32) was the
+correct choice against the FP8 teacher because it compensated for FP8
+hardware tie-breaking. Against the deterministic teacher there's
+nothing to compensate for — α=0 wins by 1.44pp corpus top1.
+
+This overturns the `diagnose-ceiling` round-4 verdict and the round-5
+"no strategy works" wrap-up. The strategies didn't work because they
+were aiming at the wrong target (FP8 hardware noise) rather than the
+underlying linear math. Once the oracle is the linear math, the
+integer student is excellent without any correction.
 
 ## The question
 
@@ -230,9 +274,16 @@ Real conceptual wins, even with zero promotable strategy changes:
 - **Don't tune knobs on a single prompt.** Use the corpus from
   `experiments/multi-prompt`. Promote a strategy only if it beats α=10/32
   by ≥1pp top1 on the corpus AND survives the contract tests.
-- **The 0.9532 corpus number is at the FP8-vs-int32 inherent floor.**
-  Meaningful further improvement requires changing the eval target (bf16 as
-  reference) or the metric (sampling-aware), not the GEMM correction.
+- ~~The 0.9532 corpus number is at the FP8-vs-int32 inherent floor.~~
+  **STRUCK by round 6.** 0.9532 was the FP8-hardware-rounding floor. Against
+  a deterministic fp32 teacher with the same FP8 codebook weights, the
+  integer student hits 0.9983 corpus top1. The right next step is to
+  **change the teacher**, not the student.
+- **Decide what the canonical reference is.** For a Freivalds-checkable
+  ZKP, the deterministic fp32 GEMM on dequantized FP8 codebook weights is
+  the better oracle: it's reproducible across GPUs (FP8 hardware rounding
+  isn't), it's mathematically clean, and the integer student matches it
+  to 4 token disagreements over a 2416-token corpus.
 - **The op-stats rank-1 closed form is mathematically clean.** It does
   exactly nothing on the corpus but it's elegant and zero-marginal-cost. If
   there's a future model with a different residual-stream structure where it
