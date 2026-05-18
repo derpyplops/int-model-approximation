@@ -41,3 +41,6 @@ experiments/lowrank-correction/
 experiments/corpus-validate/
 experiments/lowrank-corpus/
 experiments/higher-precision-corpus/
+
+# Round-6 deterministic-teacher experiment
+experiments/deterministic-teacher/
