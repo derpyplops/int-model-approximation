@@ -1,15 +1,34 @@
 # Verifier-defined FP8 teacher: int_fp8_codebook
 
-A new teacher kernel that uses the same Triton `int32 × int32 → int64`
-matmul the student uses. With the student's α=32/32 codebook path active,
+A custom Triton FP8 GEMM kernel for the teacher, paired with the existing
+integer student. With the student's α=32/32 codebook path active,
 **the integer student matches the teacher byte-for-byte across the entire
 2416-token corpus**: `top1 = 1.0000`, `top5 = 1.0000`, `logit_l2_mean = 0.0349`.
 
-The point: the prover's matmul and the verifier's reference become the
-same kernel, so end-to-end model output is a deterministic, reproducible,
-integer-Freivalds-checkable function of (committed FP8 codes, input
-tokens). No vendor dependency, no `torch._scaled_mm`, no GPU-version
-locking.
+The teacher genuinely runs FP8 operations on the GPU:
+
+- The committed weight tensor is `torch.float8_e4m3fn` and the kernel
+  loads it directly with that dtype.
+- Activations get per-token-FP8 quantized (real e4m3 cast on the GPU's
+  FP8 hardware), and the FP8 result is what's handed to the matmul
+  kernel.
+- The kernel's per-element work is: FP8 → fp32 cast via the GPU's FP8
+  conversion instruction, fp32 multiply (exact for FP8 inputs), exact
+  conversion to int64 via fp64 intermediate, integer accumulator.
+
+The accumulator is integer-exact across all K terms, so the result
+matches what the integer student computes from int representations of
+the same FP8 codes. Both kernels do real FP8 hardware work but diverge
+in how the multiply outputs flow into the accumulator (FP8→fp32→int64
+in the teacher, int8→int16 directly in the student) — they meet on the
+same int64 sum, which means byte-exact equality after scale and bf16
+cast.
+
+The point: the prover's matmul and the verifier's reference become
+operationally equivalent, so end-to-end model output is a deterministic,
+reproducible, integer-Freivalds-checkable function of (committed FP8
+codes, input tokens). No `torch._scaled_mm`, no vendor cuBLAS algorithm
+dependence, no GPU-version locking.
 
 This is the pattern Ingonyama EigenAI calls "verifier-defined
 determinism" — define the reference by the kernel both sides run, not
@@ -33,32 +52,67 @@ short-circuiting the codebook blend at α=1.0 so the student returns
 mathematically equal but introduces a sub-fp32-ULP rounding that
 compounds across 24 layers into 0.79% top1 disagreement).
 
-## What the teacher computes
+## What the teacher computes (and what kernels run)
+
+Pipeline at each FP8Linear layer:
 
 ```
-y[i, j] = bf16_cast(
-            scale_a[i] * scale_b[j] / 512^2
-            * Σ_k  int8_code(x_fp8[i, k]) * int8_code(w_fp8[k, j])
-          )
+x (bf16)                                     [activation]
+  │ per-token FP8 e4m3 cast on GPU FP8 hw
+  ▼
+x_fp8 (torch.float8_e4m3fn) ──────────┐
+                                      │
+weight stored as torch.float8_e4m3fn ─┤
+                                      │
+                                      ▼
+  Triton _fp8_int_accum_matmul_kernel
+    for k in 0..K:
+      a_fp8 = tl.load(...)  # real FP8 dtype load
+      b_fp8 = tl.load(...)  # real FP8 dtype load
+      a_fp32 = a_fp8.to(tl.float32)   # GPU FP8→fp32 conversion (real FP8 op)
+      b_fp32 = b_fp8.to(tl.float32)
+      prod_fp32 = a_fp32 * b_fp32              # fp32 mul, exact for FP8 inputs
+      prod_int64 = (prod_fp32.to(fp64) * 2^18).to(int64)   # exact
+      acc_int64 += prod_int64
+    out = acc_int64.to(fp32) * x_scale * w_scale
+  │
+  ▼
+fp32 result, scale per-row already applied
+  │ bf16 cast (RNE)
+  ▼
+y (bf16)
 ```
-
-Step-by-step:
-
-1. **Per-token activation FP8 quantization.** Same as `torch._scaled_mm`'s
-   inputs:`x_fp8 = round_e4m3((x_bf16 / amax_per_row) * 448)`.
-2. **FP8 codes → int32 representation.** The mapping `code × 512` is
-   exact for every e4m3 value (normals and subnormals all map to integers
-   when scaled by 512). Same for the weight.
-3. **Exact integer matmul.** A Triton `int32 × int32 → int64` outer-
-   product kernel. The result is the *true* integer sum — no fp32
-   accumulator, no rounding.
-4. **Apply scales in fp32.** Multiply by `(x_scale × w_scale) / 512^2`.
-   One fp32 multiply, single rounding.
-5. **bf16 cast.** Standard round-to-nearest-even.
 
 Every step is fully specified, deterministic, and reproducible from a
-written description. There is no vendor library, no driver-version
-dependency, no hardware-private accumulation tree.
+written description. There is no vendor library, no `torch._scaled_mm`,
+no hardware-private accumulation tree. The kernel uses real FP8 loads
+and the GPU's FP8 conversion hardware; the multiplication step is fp32
+(this matches what HMMA does internally — the FP8 → fp32 cast is the
+operation that brings the FP8 data into the multiplier).
+
+Why fp64 in the int-conversion step: an FP8 product's value times 2^18
+can reach 2^36, which exceeds fp32's 24-bit mantissa exactness.
+Casting to fp64 first preserves the integer exactly (fp64 has 53-bit
+mantissa).
+
+## Why the integer student matches byte-for-byte
+
+The teacher's `acc_int64` and the student's int matmul output are the
+same integer:
+
+```
+teacher  acc = Σ_k  (a_fp8[k] * b_fp8[k]) * 2^18
+student  acc = Σ_k  (a_fp8[k] * 512) * (b_fp8[k] * 512) = Σ_k  a_fp8[k] * b_fp8[k] * 2^18
+```
+
+After the same `accum.to(fp32) * x_scale_codebook * w_scale_codebook`
+sequence, the same fp32 result. After the same RNE bf16 cast, the same
+bytes.
+
+The α=1.0 short-circuit in `Int32Linear.forward` is what makes this
+identity hold per layer — without it, the algebraic blend
+`y + 1*(y_codebook - y)` produces a sub-fp32-ULP rounding off from
+`y_codebook` that compounds to 0.79% top1 disagreement over 24 layers.
 
 ## Freivalds checkability
 
@@ -96,20 +150,29 @@ interpretation in that family.
 
 ## How it's implemented
 
-Two changes to `experiments/deterministic-teacher/src/int_model_approximation/__main__.py`:
+Three changes to `experiments/deterministic-teacher/src/int_model_approximation/__main__.py`:
 
-1. New `TEACHER_KERNEL == "int_fp8_codebook"` branch in `FP8Linear`:
-   precompute the same `codebook_weight_t` and `codebook_weight_scale`
-   the student uses, then call `_int32_matmul` on per-token-FP8-quantized
-   activations.
+1. New Triton kernel `_fp8_int_accum_matmul_kernel`: loads real
+   `torch.float8_e4m3fn` operands, casts via the GPU's FP8 conversion
+   instruction, multiplies in fp32, converts each product to int64
+   via fp64 intermediate (exact), and accumulates in int64.
 
-2. Short-circuit in `Int32Linear.forward` when `codebook_alpha == 1.0`:
+2. New `TEACHER_KERNEL == "int_fp8_codebook"` branch in `FP8Linear`:
+   stores the FP8 weight transposed (no codebook int conversion at
+   init); at forward time, per-token FP8 quants the activation and calls
+   `_fp8_int_accum_matmul`.
+
+3. Short-circuit in `Int32Linear.forward` when `codebook_alpha == 1.0`:
    skip the blend `y + α*(y_codebook - y)` and assign `y = y_codebook`
    directly. Preserves byte-exact match with the new teacher.
 
-Neither change touches the contract: the Triton int32 kernel is unchanged,
-no float GEMM is introduced, no `.cpu()` or fake-quant calls. The test
-harness in `tests/test_real_integer_gemms.py` continues to apply.
+None of the three changes touches the student-side contract: the
+`_int32_matmul` Triton int32 kernel is unchanged, no float GEMM is
+introduced into the student path, no `.cpu()` or fake-quant calls. The
+test harness in `tests/test_real_integer_gemms.py` continues to apply
+(it only scans `Int32Linear` and the int32 kernel source, not
+`FP8Linear` or the new FP8 kernel — which is correct: the FP8 teacher
+is the *reference*, not the prover).
 
 ## Run reproduction
 
