@@ -9,10 +9,15 @@ integer matmul as the student.
 | metric | value |
 |---|---:|
 | corpus top1 similarity | **0.8802** |
-| corpus top5 similarity | **0.9970** |
+| corpus top5 overlap    | **0.8504** |
 | corpus logit_l2_mean   | 193.6 |
 | tokens | 2379 (Llama tokenizer, 10 prompts) |
 | device | NVIDIA B200 191 GB |
+
+(top5 metric = `topk_overlap` = mean across positions of
+`|teacher_top5 ∩ student_top5| / 5`, matching the FP8 multimodel
+sweep's definition in
+`experiments/deterministic-teacher/src/int_model_approximation/metrics.py:topk_overlap`.)
 
 Compared with FP8 on the same Llama 3.1 8B Instruct base model
 (`reports/multimodel_fp8_results.md`): FP8 cublas + naive int student
@@ -40,18 +45,18 @@ exact integer sum.
 
 ## Per-prompt results
 
-| prompt | tokens | top1 | logit_l2_mean |
-|---|---:|---:|---:|
-| p01_technical_prose | 198 | 0.848 | 166.9 |
-| p02_dense_code | 267 | 0.955 | 206.0 |
-| p03_math_derivation | 254 | 0.835 | 197.1 |
-| p04_dialog | 257 | 0.875 | 182.4 |
-| p05_multilingual | 247 | 0.838 | 190.6 |
-| p06_narrative | 191 | 0.859 | 161.1 |
-| p07_news_style | 191 | 0.901 | 159.8 |
-| p08_technical_reference | 261 | 0.897 | 262.2 |
-| p09_shell_and_config | 206 | 0.850 | 204.8 |
-| p10_list_of_facts | 307 | 0.919 | 184.3 |
+| prompt | tokens | top1 | top5_overlap | logit_l2_mean |
+|---|---:|---:|---:|---:|
+| p01_technical_prose | 198 | 0.848 | 0.856 | 166.9 |
+| p02_dense_code | 267 | 0.955 | 0.883 | 206.0 |
+| p03_math_derivation | 254 | 0.835 | 0.844 | 197.1 |
+| p04_dialog | 257 | 0.875 | 0.844 | 182.4 |
+| p05_multilingual | 247 | 0.838 | 0.822 | 190.6 |
+| p06_narrative | 191 | 0.859 | 0.874 | 161.1 |
+| p07_news_style | 191 | 0.901 | 0.868 | 159.8 |
+| p08_technical_reference | 261 | 0.897 | 0.808 | 262.2 |
+| p09_shell_and_config | 206 | 0.850 | 0.820 | 204.8 |
+| p10_list_of_facts | 307 | 0.919 | 0.882 | 184.3 |
 
 Spread 0.83 – 0.96 across prompt types; lower on
 multilingual / dialog / math (which load the dynamic range harder),
@@ -105,12 +110,14 @@ The NVFP4 path on PyTorch 2.8 + B200 has two non-obvious traps:
 |---|---|---|---:|---:|---:|
 | Llama 3.1 8B Instruct **FP8-dynamic** | cuBLAS HMMA | naive int | 0.9668 | 0.9554 | 48.5 |
 | Llama 3.1 8B Instruct **FP8-dynamic** | raw HMMA (tl.dot) | naive int | 0.9630 | 0.9575 | 48.5 |
-| Llama 3.1 8B Instruct **NVFP4** | raw HMMA (`_scaled_mm`) | per-K=16 int student | **0.8802** | 0.9970 | 193.6 |
+| Llama 3.1 8B Instruct **NVFP4** | raw HMMA (`_scaled_mm`) | per-K=16 int student | **0.8802** | 0.8504 | 193.6 |
 
 Top1 drops by ~8 pp going from FP8 to FP4 — the expected price of
 halving the per-element mantissa from 7 bits (FP8 e4m3) to 1 bit (FP4
-e2m1). Top5 is much closer (0.997 vs 0.955) because while the argmax
-flips for ~12% of tokens, the correct token usually stays in the top 5.
+e2m1). Top5 overlap drops by a similar amount (0.955 → 0.850) under the
+same `topk_overlap = mean(|set_t ∩ set_s| / 5)` metric — when the
+argmax flips, multiple nearby positions in the top-5 also tend to
+shuffle.
 
 The L2 jump (48 → 194) tracks the same story: ~4x more per-token logit
 distance, consistent with 4x less mantissa precision in the per-element
