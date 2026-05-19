@@ -116,6 +116,48 @@ The L2 jump (48 → 194) tracks the same story: ~4x more per-token logit
 distance, consistent with 4x less mantissa precision in the per-element
 multiply.
 
+## Source of the ~12% top1 disagreement: HMMA summation order
+
+A follow-up per-layer iso-error diagnostic verifies that almost all the
+error comes from the FP4 Tensor Core's hw-private summation order (the
+analogue of the "tie-breaking" finding from the FP8 HMMA work in
+`hmma_findings.md`).
+
+Setup: capture each FP4HWLinear's bf16 input during the teacher forward.
+Re-run the matching `Int4StudentLinear` on the same input (so both
+consume *identical* FP4 codes — same activation quant, same weight
+codes). Compare outputs per layer.
+
+| metric | value |
+|---|---:|
+| per-layer rel L2 (median over 224 NVFP4 linears) | **0.0028** (0.28%) |
+| per-layer rel L2 (max) | 0.0060 |
+| per-layer rel L2 (min) | 0.0014 |
+| per-layer cosine sim (median) | **0.999996** |
+| per-layer cosine sim (min) | 0.999993 |
+
+**Interpretation.** Given identical FP4 codes, the teacher (real B200
+FP4 HMMA) and student (exact integer per-K=16-block sum) agree to ~4
+nines of precision per layer. The only thing they can possibly disagree
+on is *how the per-element products are summed*: HMMA uses an
+undocumented hw-private accumulator pattern, the int student uses exact
+integer sum then fp32 scale. The bf16 output differs by ~bf16-ULP-scale
+amounts on a fraction of elements — exactly the signature of summation
+order differences hitting bf16 rounding boundaries.
+
+**Compounding.** When chained across the model's 32 transformer layers,
+the per-layer 0.28% drift accumulates: each layer's input to the int
+student diverges slightly from what the teacher saw, the FP4 activation
+quant for that layer picks slightly different codes, products differ,
+the divergence grows. By the lm_head, logit cosine sim is 0.989 (not
+0.999996) and 12% of argmax decisions flip.
+
+This is the **same mechanism** as the FP8 finding in `hmma_findings.md`:
+Hopper/Blackwell HMMA's per-instruction output is deterministic but its
+internal reduction tree isn't portably specifiable. For both FP8 and
+FP4, that hw-private ordering is the dominant non-Freivalds error
+source in the integer-student approach.
+
 ## What this run does NOT cover
 
 - **A naive int / FDA student comparison for FP4** like we had for FP8.
