@@ -165,6 +165,53 @@ internal reduction tree isn't portably specifiable. For both FP8 and
 FP4, that hw-private ordering is the dominant non-Freivalds error
 source in the integer-student approach.
 
+## Control experiment: the tensor core is the sole error source
+
+The per-layer iso test above shows the error is *small per layer*, but
+it doesn't by itself prove the error is the *tensor core* rather than
+quantization, the student's own arithmetic, or the bf16 output cast. A
+follow-up control isolates it directly. For 4 sampled layers, from the
+same captured input, the layer output is computed four ways and each
+compared to an **fp64-exact reference** built from the same FP4 codes:
+
+| comparison (fraction of bf16 output elements that differ) | layer 0 q_proj | layer 0 down_proj | layer 15 o_proj | layer 31 down_proj |
+|---|---:|---:|---:|---:|
+| FP4 codes identical (teacher vs student) | yes | yes | yes | yes |
+| int student vs fp64-exact | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
+| plain fp32 sum → bf16 vs exact-bf16 | 0.0003 | 0.0003 | 0.0006 | 0.0003 |
+| **tensor core vs exact-bf16** | **0.267** | **0.267** | **0.262** | **0.265** |
+| tensor core vs int student | 0.267 | 0.267 | 0.262 | 0.265 |
+
+Relative L2 distance to fp64-exact (pre-bf16): int student = `0.0`
+(exact), plain fp32 sum = `~1e-7`, tensor core = `~1.6e-3`.
+
+**Elimination, measured not inferred:**
+
+- **Not quantization** — the teacher's and student's FP4 codes are
+  bit-identical.
+- **Not the student** — its output equals the fp64-exact reference to
+  the bit (`0.0000` element diff, `0.0` rel L2). The integer per-K=16
+  block sum is genuinely exact arithmetic.
+- **Not the bf16 output cast** — a plain fp32 sum cast to bf16 matches
+  exact-bf16 on 99.94–99.97% of elements. Output rounding alone explains
+  almost none of the disagreement.
+- **It is the tensor core** — its bf16 output differs from exact on
+  ~26% of elements per layer, ~500× more than plain-precision math.
+
+**Refinement vs the FP8 story.** For FP8 the tensor core deviation was
+consistent with a different fp32 *summation order* (`hmma_findings.md`).
+For FP4 the deviation (`1.6e-3`) is far larger than any fp32 reordering
+(`1e-7`), so the FP4 tensor core is not merely summing in a different
+order — it accumulates in *reduced precision* (a narrower internal
+accumulator than fp32). Either way the cause is the tensor core's
+internal arithmetic, which is undocumented and not replicable by a
+portable integer kernel.
+
+So the claim "almost all of the error comes from the tensor core" is,
+for FP4, grounded by direct measurement: with quantization, the student,
+and the output cast all individually shown to contribute ~zero, the
+tensor core's internal accumulation is the entire remaining source.
+
 ## What this run does NOT cover
 
 - **A naive int / FDA student comparison for FP4** like we had for FP8.
