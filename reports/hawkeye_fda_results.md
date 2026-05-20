@@ -1,14 +1,16 @@
 # Hawkeye chained-FDA: integer student bit-exactly reproduces Hopper FP8 tensor cores
 
-## Result
+## Result (one-line, honest)
 
 Using the Hawkeye accumulation model (arXiv 2603.20421, Badash/Boneh/
 Komargodski/Srivastava + their repo `github.com/badasherez/gpu-simulator`),
 a Freivalds-checkable **integer student reproduces a real Hopper FP8
-tensor-core GEMM bit-for-bit** at every Qwen2.5-0.5B layer size. This
-breaks the prior ceiling: with a chained-QGMMA teacher and this student,
-end-to-end corpus **top1 = 1.0**, beating the recorded 0.9532
-(cuBLAS-teacher + naive-int-student) baseline.
+chained-QGMMA tensor-core GEMM bit-for-bit, end-to-end on real Qwen-0.5B
+activations** (measured top1 = 1.0, bf16 logits bit-exact). It does
+**not** beat the 0.9532 baseline against the production cuBLAS path —
+against cuBLAS it scores 0.9125. The 1.0 holds only when the deployed
+FP8 kernel *is* the chained-QGMMA kernel the student replays. See
+"Honest reading" below.
 
 ## Why the previous attempts stalled (two bugs, both diagnosed)
 
@@ -51,15 +53,54 @@ A `tl.dot` Triton teacher is **not** a valid oracle — it does not emit
 the bare QGMMA (it accumulates at higher precision), which is why an
 earlier comparison gave a spurious 0.28.
 
-## Implication for corpus top1
+## MEASURED corpus result (real Qwen-0.5B forward, real activations)
 
-Per-layer bit-exactness between (real chained-QGMMA teacher) and
-(integer Hawkeye student) ⟹ the full forward is bit-identical ⟹ logits
-are bit-identical ⟹ **corpus top1 = 1.0**. This is by construction, not
-approximation. The improvement over the 0.9532 baseline comes from
-*defining the teacher as the chained-QGMMA kernel* (a real FP8 hardware
-computation with a known tile schedule) and replaying it exactly in
-integer arithmetic — exactly the approach the project was reaching for.
+Ran the actual model three ways and compared logits (5 prompts × 48
+tokens = 240 tokens; teacher = real chained-QGMMA via Hawkeye's
+validated `mma_fp8_e4m3`; student = integer Hawkeye replay; cublas =
+`torch._scaled_mm`, the production FP8 path and the 0.9532 baseline's
+teacher):
+
+| comparison | measured top1 |
+|---|---:|
+| **student vs chained-QGMMA teacher** | **1.0000** (bf16 logits bit-exact, every token) |
+| student vs cuBLAS | 0.9125 |
+| teacher (chained-QGMMA) vs cuBLAS | 0.9125 |
+
+This is measured, not inferred. The integer student reproduces the real
+chained-QGMMA tensor-core output **bit-for-bit, end-to-end, on real
+activations**.
+
+## Honest reading — does it beat 0.9532?
+
+**It depends entirely on what counts as "the teacher", and the headline
+"1.0 beats 0.9532" is misleading without this caveat:**
+
+- The baseline 0.9532 was *student (naive int) vs **cuBLAS***.
+- The 1.0 here is *student (Hawkeye) vs **chained-QGMMA***, a different,
+  specific FP8 kernel that the student is built to replay exactly.
+- Against the **production cuBLAS path**, the Hawkeye student scores
+  **0.9125 — below the 0.9532 baseline**. cuBLAS uses split-K / a
+  different tile schedule, so neither the chained-QGMMA teacher nor the
+  Hawkeye student matches it; in fact the old naive-int student (exact
+  integer sum) tracked cuBLAS *better* (0.9532) than the lossy
+  14-bit-internal chained-QGMMA does (0.9125).
+
+So the genuine, defensible result is **not** "we beat the baseline." It
+is:
+
+> A Freivalds-checkable integer student reproduces a real Hopper
+> chained-QGMMA FP8 GEMM **bit-for-bit, end-to-end on real Qwen
+> activations** (measured top1 = 1.0, bf16 logits bit-exact). This is a
+> real capability for verifiable inference — *if the model is deployed
+> with the chained-QGMMA kernel.* It does **not** improve agreement with
+> the production cuBLAS FP8 path (0.9125 < 0.9532).
+
+The 1.0 is real and non-circular (the teacher runs real tensor cores via
+the validated `wgmma` instruction; the student is independent integer
+arithmetic), but it is achieved by making the deployed kernel equal to
+the one the student replays — not by better-approximating the existing
+cuBLAS model.
 
 ## Freivalds-checkability preserved
 
